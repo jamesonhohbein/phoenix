@@ -106,6 +106,13 @@ ENV_PHOENIX_SQL_DATABASE_SCHEMA = "PHOENIX_SQL_DATABASE_SCHEMA"
 The schema to use for the PostgresSQL database. (This is ignored for SQLite.)
 See e.g. https://www.postgresql.org/docs/current/ddl-schemas.html
 """
+ENV_PHOENIX_POSTGRES_AUTH_MODE = "PHOENIX_POSTGRES_AUTH_MODE"
+"""
+Selects Postgres authentication mode. When set to 'azure' (case-insensitive),
+the server will use an Azure Active Directory access token (via azure.identity)
+as the database password for Postgres connections. Any other value or when unset
+disables Azure-based token authentication.
+"""
 ENV_PHOENIX_DATABASE_ALLOCATED_STORAGE_CAPACITY_GIBIBYTES = (
     "PHOENIX_DATABASE_ALLOCATED_STORAGE_CAPACITY_GIBIBYTES"
 )
@@ -1383,6 +1390,22 @@ def get_env_database_schema() -> Optional[str]:
     if get_env_database_connection_str().startswith("sqlite"):
         return None
     return getenv(ENV_PHOENIX_SQL_DATABASE_SCHEMA)
+
+
+def get_env_postgres_auth_mode() -> str:
+    """
+    Get the Postgres authentication mode.
+
+    Returns
+    -------
+    str
+        "azure" when PHOENIX_POSTGRES_AUTH_MODE is set to "azure" (case-insensitive),
+        otherwise an empty string.
+    """
+    value = getenv(ENV_PHOENIX_POSTGRES_AUTH_MODE)
+    if value is None:
+        return ""
+    return "azure" if value.strip().lower() == "azure" else ""
 
 
 def get_env_database_allocated_storage_capacity_gibibytes() -> Optional[float]:

@@ -1,13 +1,17 @@
 import asyncio
+import os
 
 from alembic import context
 from sqlalchemy import Connection, engine_from_config, pool
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine,create_async_engine
+from sqlalchemy import make_url
 
-from phoenix.config import get_env_database_connection_str
+from phoenix.config import get_env_database_connection_str, get_env_postgres_auth_mode
 from phoenix.db.engines import get_async_db_url
 from phoenix.db.models import Base
 from phoenix.settings import Settings
+from phoenix.db.pg_config import get_pg_config
+from phoenix.db import pg_token as pg_token_mod
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -60,18 +64,70 @@ def run_migrations_online() -> None:
         config = context.config.get_section(context.config.config_ini_section) or {}
         if "sqlalchemy.url" not in config:
             connection_str = get_env_database_connection_str()
-            config["sqlalchemy.url"] = get_async_db_url(connection_str).render_as_string(
-                hide_password=False
+            async_url = get_async_db_url(connection_str)
+            # If using Postgres, optionally build an Azure token-aware async engine
+            if async_url.drivername.startswith("postgresql+"):
+                asyncpg_url, asyncpg_args = get_pg_config(make_url(connection_str), "asyncpg")
+
+                mode = get_env_postgres_auth_mode()
+                if mode == "azure":
+                    async def _asyncpg_creator():
+                        import asyncpg  # type: ignore
+
+                        user = asyncpg_url.username or asyncpg_url.query.get("user")
+                        # Inject Azure token as password
+                        password = pg_token_mod.get_token_value()
+
+                        connect_kwargs = {}
+                        if ssl := asyncpg_args.get("ssl"):
+                            connect_kwargs["ssl"] = ssl
+                        return await asyncpg.connect(
+                            host=asyncpg_url.host,
+                            port=asyncpg_url.port,
+                            database=asyncpg_url.database,
+                            user=user,
+                            password=password,
+                            **connect_kwargs,
+                        )
+
+                    connectable = create_async_engine(
+                        url=asyncpg_url,
+                        future=True,
+                        echo=Settings.log_migrations,
+                        poolclass=pool.NullPool,
+                        async_creator=_asyncpg_creator,
+                    )
+                else:
+                    # Non-Azure: preserve original connect_args-based construction
+                    connectable = create_async_engine(
+                        url=asyncpg_url,
+                        future=True,
+                        echo=Settings.log_migrations,
+                        poolclass=pool.NullPool,
+                        connect_args=asyncpg_args,
+                    )
+            else:
+                # Fallback to engine_from_config for non-Postgres
+                config["sqlalchemy.url"] = async_url.render_as_string(hide_password=False)
+                connectable = AsyncEngine(
+                    engine_from_config(
+                        config,
+                        prefix="sqlalchemy.",
+                        poolclass=pool.NullPool,
+                        future=True,
+                        echo=Settings.log_migrations,
+                    )
+                )
+        else:
+            connectable = AsyncEngine(
+                engine_from_config(
+                    config,
+                    prefix="sqlalchemy.",
+                    poolclass=pool.NullPool,
+                    future=True,
+                    echo=Settings.log_migrations,
+                )
             )
-        connectable = AsyncEngine(
-            engine_from_config(
-                config,
-                prefix="sqlalchemy.",
-                poolclass=pool.NullPool,
-                future=True,
-                echo=Settings.log_migrations,
-            )
-        )
 
     if isinstance(connectable, AsyncEngine):
         try:

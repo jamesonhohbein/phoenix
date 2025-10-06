@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+import os
 from enum import Enum
 from sqlite3 import Connection
 from typing import Any
@@ -16,12 +17,13 @@ from sqlalchemy import URL, StaticPool, event, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from typing_extensions import assert_never
 
-from phoenix.config import LoggingMode, get_env_database_schema
+from phoenix.config import LoggingMode, get_env_database_schema, get_env_postgres_auth_mode
 from phoenix.db.helpers import SupportedSQLDialect
 from phoenix.db.migrate import migrate_in_thread
 from phoenix.db.models import init_models
 from phoenix.db.pg_config import get_pg_config
 from phoenix.settings import Settings
+from phoenix.db import pg_token as pg_token_mod
 
 sqlean.extensions.enable("text", "stats")
 
@@ -169,22 +171,82 @@ def aio_postgresql_engine(
     log_migrations_to_stdout: bool = True,
 ) -> AsyncEngine:
     asyncpg_url, asyncpg_args = get_pg_config(url, "asyncpg")
-    engine = create_async_engine(
-        url=asyncpg_url,
-        connect_args=asyncpg_args,
-        echo=log_to_stdout,
-        json_serializer=_dumps,
-    )
+    mode = get_env_postgres_auth_mode()
+
+    if mode == "azure":
+        async def _asyncpg_creator():
+            import asyncpg  # type: ignore
+
+            # Determine user and password
+            user = asyncpg_url.username or asyncpg_url.query.get("user")
+            password = asyncpg_url.password or asyncpg_url.query.get("password")
+            # Inject Azure token as password
+            password = pg_token_mod.get_token_value()
+
+            connect_kwargs = {}
+            if ssl := asyncpg_args.get("ssl"):
+                connect_kwargs["ssl"] = ssl
+
+            return await asyncpg.connect(
+                host=asyncpg_url.host,
+                port=asyncpg_url.port,
+                database=asyncpg_url.database,
+                user=user,
+                password=password,
+                **connect_kwargs,
+            )
+
+        engine = create_async_engine(
+            url=asyncpg_url,
+            echo=log_to_stdout,
+            json_serializer=_dumps,
+            pool_pre_ping=True,
+            async_creator=_asyncpg_creator,
+        )
+    else:
+        # Non-Azure: preserve original connect_args-based construction
+        engine = create_async_engine(
+            url=asyncpg_url,
+            connect_args=asyncpg_args,
+            echo=log_to_stdout,
+            json_serializer=_dumps,
+        )
     if not migrate:
         return engine
 
     psycopg_url, psycopg_args = get_pg_config(url, "psycopg")
-    sync_engine = sqlalchemy.create_engine(
-        url=psycopg_url,
-        connect_args=psycopg_args,
-        echo=log_migrations_to_stdout,
-        json_serializer=_dumps,
-    )
+    if mode == "azure":
+        # Use creator to inject token per connection for migrations
+        def _psycopg_creator():
+            import psycopg  # type: ignore
+
+            user = psycopg_url.username or psycopg_url.query.get("user")
+            # Inject Azure token as password
+            password = pg_token_mod.get_token_value()
+
+            return psycopg.connect(
+                host=psycopg_url.host,
+                port=psycopg_url.port,
+                dbname=str(psycopg_url.database or ""),
+                user=str(user or ""),
+                password=str(password or ""),
+                **psycopg_args,
+            )
+
+        sync_engine = sqlalchemy.create_engine(
+            url=psycopg_url,
+            echo=log_migrations_to_stdout,
+            json_serializer=_dumps,
+            creator=_psycopg_creator,
+        )
+    else:
+        # Non-Azure: preserve original connect_args-based construction
+        sync_engine = sqlalchemy.create_engine(
+            url=psycopg_url,
+            connect_args=psycopg_args,
+            echo=log_migrations_to_stdout,
+            json_serializer=_dumps,
+        )
     if schema := get_env_database_schema():
         event.listen(sync_engine, "connect", set_postgresql_search_path(schema))
     migrate_in_thread(sync_engine)
