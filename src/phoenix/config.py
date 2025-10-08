@@ -110,8 +110,7 @@ ENV_PHOENIX_POSTGRES_AUTH_MODE = "PHOENIX_POSTGRES_AUTH_MODE"
 """
 Selects Postgres authentication mode. When set to 'azure' (case-insensitive),
 the server will use an Azure Active Directory access token (via azure.identity)
-as the database password for Postgres connections. Any other value or when unset
-disables Azure-based token authentication.
+as the database password for Postgres connections. This is the only supported value.
 """
 ENV_PHOENIX_DATABASE_ALLOCATED_STORAGE_CAPACITY_GIBIBYTES = (
     "PHOENIX_DATABASE_ALLOCATED_STORAGE_CAPACITY_GIBIBYTES"

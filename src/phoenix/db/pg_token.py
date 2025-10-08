@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
-import shlex
-import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import Lock
@@ -15,14 +12,15 @@ logger = logging.getLogger(__name__)
 
 from phoenix.config import get_env_postgres_auth_mode
 
-# Environment variables (kept local to this module to avoid coupling)
-ENV_AUTH_MODE = "PHOENIX_POSTGRES_AUTH_MODE"  # values: token-env, token-cmd, azure
-ENV_TOKEN = "PHOENIX_POSTGRES_TOKEN"
-ENV_TOKEN_EXPIRES_AT = "PHOENIX_POSTGRES_TOKEN_EXPIRES_AT"  # ISO8601, e.g. 2025-01-01T12:34:56Z
-ENV_TOKEN_TTL_SECONDS = "PHOENIX_POSTGRES_TOKEN_TTL_SECONDS"  # int
-ENV_TOKEN_SKEW_SECONDS = "PHOENIX_POSTGRES_TOKEN_SKEW_SECONDS"  # int, default 60
-ENV_TOKEN_CMD = "PHOENIX_POSTGRES_TOKEN_CMD"  # command to run
-ENV_TOKEN_CMD_TIMEOUT_SECONDS = "PHOENIX_POSTGRES_TOKEN_CMD_TIMEOUT_SECONDS"  # int, default 10
+# Environment variables
+ENV_TOKEN_SKEW_SECONDS = "PHOENIX_POSTGRES_TOKEN_SKEW_SECONDS"
+"""A safety buffer, in seconds, to proactively refresh a token before it expires.
+
+This helps prevent connection failures due to network latency or clock skew by ensuring
+the application does not use a token that is about to expire. For example, if set
+to 60 (the default), a token will be considered expired 60 seconds before its
+actual expiration time, triggering a refresh.
+"""
 
 # Azure-specific configuration
 ENV_AZURE_AUTH_MODE = "PHOENIX_AZURE_AUTH_MODE"  # values: managed, default
@@ -50,111 +48,6 @@ class Token:
 class TokenProvider(Protocol):
     def get_token(self) -> Token:
         ...
-
-
-def _parse_iso8601(value: str) -> Optional[datetime]:
-    try:
-        # Accept values like "2025-01-01T12:34:56Z" and with offsets
-        if value.endswith("Z"):
-            value = value[:-1] + "+00:00"
-        dt = datetime.fromisoformat(value)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception as e:
-        logger.warning("Failed to parse token expiry '%s': %s", value, e)
-        return None
-
-
-class EnvTokenProvider:
-    """Reads token and expiry from environment variables.
-
-    - PHOENIX_POSTGRES_TOKEN
-    - PHOENIX_POSTGRES_TOKEN_EXPIRES_AT (ISO8601) or PHOENIX_POSTGRES_TOKEN_TTL_SECONDS
-    """
-
-    def get_token(self) -> Token:
-        token_value = os.getenv(ENV_TOKEN)
-        if not token_value:
-            raise RuntimeError(
-                f"Environment token not set. Please set {ENV_TOKEN}."
-            )
-        expires_at_str = os.getenv(ENV_TOKEN_EXPIRES_AT)
-        if expires_at_str:
-            expires_at = _parse_iso8601(expires_at_str)
-        else:
-            ttl = os.getenv(ENV_TOKEN_TTL_SECONDS)
-            expires_at = (
-                datetime.now(timezone.utc) + timedelta(seconds=int(ttl))
-                if ttl and ttl.isdigit()
-                else None
-            )
-        return Token(value=token_value, expires_at=expires_at)
-
-
-class CommandTokenProvider:
-    """Runs a command to fetch a token.
-
-    Expected outputs:
-      - JSON object with keys: {"token": "...", "expires_at": "ISO8601"} (expires_at optional)
-      - Plain string token; expiry inferred from PHOENIX_POSTGRES_TOKEN_TTL_SECONDS
-    """
-
-    def __init__(self) -> None:
-        cmd = os.getenv(ENV_TOKEN_CMD)
-        if not cmd:
-            raise RuntimeError(
-                f"Token command not set. Please set {ENV_TOKEN_CMD}."
-            )
-        self._cmd = cmd
-        timeout_env = os.getenv(ENV_TOKEN_CMD_TIMEOUT_SECONDS)
-        self._timeout = int(timeout_env) if timeout_env and timeout_env.isdigit() else 10
-
-    def get_token(self) -> Token:
-        try:
-            # Use shlex.split to avoid shell=True risks.
-            logger.debug("Running token command: %s", self._cmd)
-            result = subprocess.run(
-                shlex.split(self._cmd),
-                capture_output=True,
-                text=True,
-                timeout=self._timeout,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"Token command failed (exit {result.returncode}): {result.stderr.strip()}"
-                )
-            output = result.stdout.strip()
-            # Try JSON first
-            token_value: Optional[str] = None
-            expires_at: Optional[datetime] = None
-            if output.startswith("{"):
-                try:
-                    payload = json.loads(output)
-                    token_value = payload.get("token")
-                    if not isinstance(token_value, str) or not token_value:
-                        raise ValueError("JSON payload missing 'token' string field")
-                    expires_str = payload.get("expires_at")
-                    if isinstance(expires_str, str):
-                        expires_at = _parse_iso8601(expires_str)
-                except Exception as e:
-                    raise RuntimeError(f"Failed to parse JSON token: {e}")
-            else:
-                token_value = output
-
-            if not token_value:
-                raise RuntimeError("Token command produced no token value")
-
-            if expires_at is None:
-                ttl = os.getenv(ENV_TOKEN_TTL_SECONDS)
-                expires_at = (
-                    datetime.now(timezone.utc) + timedelta(seconds=int(ttl))
-                    if ttl and ttl.isdigit()
-                    else None
-                )
-            return Token(value=token_value, expires_at=expires_at)
-        except Exception as e:
-            raise RuntimeError(f"Failed to obtain token via command: {e}")
 
 
 class CachedTokenProvider:
@@ -185,34 +78,11 @@ class CachedTokenProvider:
 _singleton_provider: Optional[CachedTokenProvider] = None
 
 
-def _build_provider_from_env() -> CachedTokenProvider:
-    # Prefer Azure mode via centralized config toggle
-    config_mode = get_env_postgres_auth_mode()
-    mode = (os.getenv(ENV_AUTH_MODE) or "").strip().lower()
+def _build_provider() -> CachedTokenProvider:
     skew_env = os.getenv(ENV_TOKEN_SKEW_SECONDS)
     skew_seconds = int(skew_env) if skew_env and skew_env.isdigit() else 60
-
-    if config_mode == "azure" or mode in ("azure",):
-        base = AzureTokenProvider()
-    elif mode in ("token-env", "env"):
-        base = EnvTokenProvider()
-    elif mode in ("token-cmd", "cmd"):
-        base = CommandTokenProvider()
-    else:
-        # Default to env-based if mode unspecified
-        base = EnvTokenProvider()
-        if not os.getenv(ENV_TOKEN):
-            logger.warning(
-                "%s not set and %s unspecified; falling back to env provider which will error if token is missing.",
-                ENV_TOKEN,
-                ENV_AUTH_MODE,
-            )
-    logger.debug(
-        "Selected token provider: %s (config_mode=%s, env_mode=%s)",
-        type(base).__name__,
-        config_mode or "",
-        mode or "",
-    )
+    base = AzureTokenProvider()
+    logger.debug("Selected token provider: %s", type(base).__name__)
     return CachedTokenProvider(base, skew_seconds=skew_seconds)
 
 
@@ -224,32 +94,13 @@ def get_token() -> Token:
     """
     global _singleton_provider
     if _singleton_provider is None:
-        _singleton_provider = _build_provider_from_env()
+        _singleton_provider = _build_provider()
     return _singleton_provider.get_token()
 
 
 def get_token_value() -> str:
     """Convenience helper to return only the token string."""
     return get_token().value
-
-
-def set_token_provider(provider: TokenProvider, *, skew_seconds: Optional[int] = None) -> None:
-    """Override the global token provider with an explicit instance.
-
-    Useful for dependency injection in tests or in multi-process environments
-    where implicit globals are undesirable.
-    """
-    global _singleton_provider
-    if skew_seconds is None:
-        skew_env = os.getenv(ENV_TOKEN_SKEW_SECONDS)
-        skew_seconds = int(skew_env) if skew_env and skew_env.isdigit() else 60
-    _singleton_provider = CachedTokenProvider(provider, skew_seconds=skew_seconds)
-
-
-def clear_token_provider() -> None:
-    """Clear the global token provider, forcing rebuild on next access."""
-    global _singleton_provider
-    _singleton_provider = None
 
 
 # -----------------------------
@@ -307,13 +158,7 @@ class AzureTokenProvider:
             if isinstance(expires_on, (int, float)):
                 expires_at = datetime.fromtimestamp(int(expires_on), tz=timezone.utc)
             else:
-                # Fallback to TTL env or unknown expiry
-                ttl_env = os.getenv(ENV_TOKEN_TTL_SECONDS)
-                expires_at = (
-                    datetime.now(timezone.utc) + timedelta(seconds=int(ttl_env))
-                    if ttl_env and ttl_env.isdigit()
-                    else None
-                )
+                expires_at = None
             return Token(value=token_str, expires_at=expires_at)
         except Exception as e:
             raise RuntimeError(f"Failed to obtain Azure AD token: {e}")
